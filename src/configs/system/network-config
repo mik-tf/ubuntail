@@ -3,6 +3,6 @@ network:
   ethernets:
     any:
       match:
-        name: en*
+        name: "en*|eth*"
       dhcp4: true
       optional: true

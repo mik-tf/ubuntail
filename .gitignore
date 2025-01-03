@@ -5,6 +5,8 @@
 *.efi
 *.o
 *.log
+/temp
+all_files_text.txt
 
 # Sensitive information
 credentials.env

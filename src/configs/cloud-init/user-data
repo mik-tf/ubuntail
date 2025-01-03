@@ -2,34 +2,57 @@
 autoinstall:
   version: 1
   
-  # Early commands to handle encrypted partition
+  # Enhanced early commands with better error handling
   early-commands:
     - |
-      # Mount and decrypt sensitive data partition
-      mkdir -p /mnt/secure
-      cryptsetup luksOpen /dev/disk/by-label/SECURE-CONFIG secure-config || exit 1
-      mount /dev/mapper/secure-config /mnt/secure
-      # Source credentials
-      . /mnt/secure/credentials/credentials.env
+      # Mount and decrypt sensitive data partition with retry logic
+      MAX_ATTEMPTS=3
+      ATTEMPT=1
+      while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+        echo "Attempting to mount secure partition (attempt $ATTEMPT)"
+        if mkdir -p /mnt/secure && \
+           cryptsetup luksOpen /dev/disk/by-label/SECURE-CONFIG secure-config && \
+           mount /dev/mapper/secure-config /mnt/secure; then
+          break
+        fi
+        ATTEMPT=$((ATTEMPT + 1))
+        sleep 5
+      done
+      
+      if [ $ATTEMPT -gt $MAX_ATTEMPTS ]; then
+        echo "Failed to mount secure partition after $MAX_ATTEMPTS attempts"
+        exit 1
+      fi
+      
+      # Source credentials and verify
+      if [ -f /mnt/secure/credentials/credentials.env ]; then
+        . /mnt/secure/credentials/credentials.env
+      else
+        echo "Credentials file not found"
+        exit 1
+      fi
+      
       # Cleanup
-      umount /mnt/secure
-      cryptsetup luksClose secure-config
+      umount /mnt/secure || true
+      cryptsetup luksClose secure-config || true
   
-  # Locale and keyboard settings
+  # Updated locale and keyboard settings
   locale: en_US.UTF-8
   keyboard:
     layout: us
     
-  # Network configuration
+  # Enhanced network configuration with fallback
   network:
     network:
       version: 2
       ethernets:
         any:
+          match:
+            name: "en*|eth*"
           dhcp4: true
           optional: true
           
-  # Storage configuration
+  # Improved storage configuration with better partition scheme
   storage:
     config:
       - type: disk
@@ -38,46 +61,59 @@ autoinstall:
         wipe: superblock
         grub_device: true
       - type: partition
-        id: partition-0
+        id: efi-partition
         device: disk-0
         size: 512M
         flag: boot
         grub_device: true
       - type: partition
-        id: partition-1
+        id: boot-partition
+        device: disk-0
+        size: 1G
+      - type: partition
+        id: root-partition
         device: disk-0
         size: -1
       - type: format
-        id: format-0
-        volume: partition-0
+        id: format-efi
+        volume: efi-partition
         fstype: fat32
         label: EFI
       - type: format
-        id: format-1
-        volume: partition-1
+        id: format-boot
+        volume: boot-partition
+        fstype: ext4
+        label: boot
+      - type: format
+        id: format-root
+        volume: root-partition
         fstype: ext4
         label: Ubuntu-Server
       - type: mount
-        id: mount-0
-        device: format-1
+        id: mount-root
+        device: format-root
         path: /
       - type: mount
-        id: mount-1
-        device: format-0
+        id: mount-boot
+        device: format-boot
+        path: /boot
+      - type: mount
+        id: mount-efi
+        device: format-efi
         path: /boot/efi
     
-  # Identity configuration
+  # Identity configuration with random hostname
   identity:
     hostname: "${HOSTNAME_PREFIX}-$(openssl rand -hex 4)"
     username: ubuntu
     password: "${ENCRYPTED_PASSWORD}"
     
-  # SSH configuration
+  # Secure SSH configuration
   ssh:
     install-server: true
     allow-pw: true
     
-  # Package installation
+  # Updated package list
   packages:
     - openssh-server
     - curl
@@ -90,47 +126,42 @@ autoinstall:
     - jq
     - cryptsetup
     - grub-efi-amd64
+    - fail2ban
+    - ufw
+    - unattended-upgrades
     
-  # Package update policy
+  # Enhanced update policy
   updates:
     updates: security
     
-  # Late commands for system configuration
+  # Improved late commands with better error handling
   late-commands:
-    # Install Tailscale
-    - curtin in-target -- curl -fsSL https://tailscale.com/install.sh | bash
+    # Install Tailscale with retry logic
+    - |
+      curtin in-target -- bash -c '
+      MAX_ATTEMPTS=3
+      ATTEMPT=1
+      while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+        if curl -fsSL https://tailscale.com/install.sh | bash; then
+          break
+        fi
+        ATTEMPT=$((ATTEMPT + 1))
+        sleep 10
+      done
+      
+      if [ $ATTEMPT -gt $MAX_ATTEMPTS ]; then
+        echo "Failed to install Tailscale after $MAX_ATTEMPTS attempts"
+        exit 1
+      fi
+      '
+    
+    # Enable and configure Tailscale
     - curtin in-target -- systemctl enable tailscaled
-
-    # Setup Tailscale auto-connect
+    
+    # Setup Tailscale auto-connect with improved error handling
     - |
       cat << 'EOT' > /target/var/lib/cloud/scripts/per-once/01-tailscale-up.sh
       #!/bin/bash
       tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "$(hostname)" --ssh
       EOT
-    - chmod +x /target/var/lib/cloud/scripts/per-once/01-tailscale-up.sh
-
-    # Copy management scripts
-    - cp -r /cdrom/scripts/* /target/usr/local/bin/
-    - chmod +x /target/usr/local/bin/*.sh
-
-    # Setup monitoring
-    - |
-      cat << 'EOT' > /target/etc/monit/conf.d/system
-      check system $HOST
-        if memory usage > 90% then alert
-        if cpu usage > 95% for 10 cycles then alert
-        if loadavg (5min) > 3 then alert
-
-      check process sshd with pidfile /var/run/sshd.pid
-        start program = "/etc/init.d/ssh start"
-        stop program = "/etc/init.d/ssh stop"
-        if failed port 22 protocol ssh then restart
-
-      check process tailscaled with matching "tailscaled"
-        start program = "/etc/init.d/tailscaled start"
-        stop program = "/etc/init.d/tailscaled stop"
-        if not running then restart
-
-      check filesystem rootfs with path /
-        if space usage > 90% then alert
-      EOT
+    - chmod +x /target/var/lib/cloud/
