@@ -1,0 +1,136 @@
+#cloud-config
+autoinstall:
+  version: 1
+  
+  # Early commands to handle encrypted partition
+  early-commands:
+    - |
+      # Mount and decrypt sensitive data partition
+      mkdir -p /mnt/secure
+      cryptsetup luksOpen /dev/disk/by-label/SECURE-CONFIG secure-config || exit 1
+      mount /dev/mapper/secure-config /mnt/secure
+      # Source credentials
+      . /mnt/secure/credentials/credentials.env
+      # Cleanup
+      umount /mnt/secure
+      cryptsetup luksClose secure-config
+  
+  # Locale and keyboard settings
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+    
+  # Network configuration
+  network:
+    network:
+      version: 2
+      ethernets:
+        any:
+          dhcp4: true
+          optional: true
+          
+  # Storage configuration
+  storage:
+    config:
+      - type: disk
+        id: disk-0
+        ptable: gpt
+        wipe: superblock
+        grub_device: true
+      - type: partition
+        id: partition-0
+        device: disk-0
+        size: 512M
+        flag: boot
+        grub_device: true
+      - type: partition
+        id: partition-1
+        device: disk-0
+        size: -1
+      - type: format
+        id: format-0
+        volume: partition-0
+        fstype: fat32
+        label: EFI
+      - type: format
+        id: format-1
+        volume: partition-1
+        fstype: ext4
+        label: Ubuntu-Server
+      - type: mount
+        id: mount-0
+        device: format-1
+        path: /
+      - type: mount
+        id: mount-1
+        device: format-0
+        path: /boot/efi
+    
+  # Identity configuration
+  identity:
+    hostname: "${HOSTNAME_PREFIX}-$(openssl rand -hex 4)"
+    username: ubuntu
+    password: "${ENCRYPTED_PASSWORD}"
+    
+  # SSH configuration
+  ssh:
+    install-server: true
+    allow-pw: true
+    
+  # Package installation
+  packages:
+    - openssh-server
+    - curl
+    - wget
+    - net-tools
+    - htop
+    - monit
+    - cron
+    - logwatch
+    - jq
+    - cryptsetup
+    - grub-efi-amd64
+    
+  # Package update policy
+  updates:
+    updates: security
+    
+  # Late commands for system configuration
+  late-commands:
+    # Install Tailscale
+    - curtin in-target -- curl -fsSL https://tailscale.com/install.sh | bash
+    - curtin in-target -- systemctl enable tailscaled
+
+    # Setup Tailscale auto-connect
+    - |
+      cat << 'EOT' > /target/var/lib/cloud/scripts/per-once/01-tailscale-up.sh
+      #!/bin/bash
+      tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "$(hostname)" --ssh
+      EOT
+    - chmod +x /target/var/lib/cloud/scripts/per-once/01-tailscale-up.sh
+
+    # Copy management scripts
+    - cp -r /cdrom/scripts/* /target/usr/local/bin/
+    - chmod +x /target/usr/local/bin/*.sh
+
+    # Setup monitoring
+    - |
+      cat << 'EOT' > /target/etc/monit/conf.d/system
+      check system $HOST
+        if memory usage > 90% then alert
+        if cpu usage > 95% for 10 cycles then alert
+        if loadavg (5min) > 3 then alert
+
+      check process sshd with pidfile /var/run/sshd.pid
+        start program = "/etc/init.d/ssh start"
+        stop program = "/etc/init.d/ssh stop"
+        if failed port 22 protocol ssh then restart
+
+      check process tailscaled with matching "tailscaled"
+        start program = "/etc/init.d/tailscaled start"
+        stop program = "/etc/init.d/tailscaled stop"
+        if not running then restart
+
+      check filesystem rootfs with path /
+        if space usage > 90% then alert
+      EOT
