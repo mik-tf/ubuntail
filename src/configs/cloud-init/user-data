@@ -105,7 +105,7 @@ autoinstall:
   # Identity configuration with random hostname
   identity:
     hostname: "${HOSTNAME_PREFIX}-$(openssl rand -hex 4)"
-    username: ubuntu
+    username: "${NODE_USERNAME}"
     password: "${ENCRYPTED_PASSWORD}"
     
   # Secure SSH configuration
