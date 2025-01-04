@@ -1,5 +1,4 @@
 #!/bin/bash
-# ubuntail.sh - Main installer script with improved error handling, logging, and Ubuntu 24.04 support
 
 # Colors for output
 RED='\033[0;31m'
@@ -14,6 +13,7 @@ NC='\033[0m'
 set -euo pipefail
 trap 'echo -e "${RED}Error on line $LINENO${NC}"' ERR
 
+
 # Configuration
 REQUIRED_SPACE_GB=16
 UBUNTU_VERSION="24.04"
@@ -21,7 +21,26 @@ TAILSCALE_RETRY_ATTEMPTS=3
 TAILSCALE_RETRY_DELAY=30
 LOG_FILE="/var/log/ubuntu-tailscale-installer.log"
 
-# Redirect all output to log file
+# Function to setup logging
+setup_logging() {
+    # Create log file with proper permissions
+    touch "$LOG_FILE"
+    chmod 644 "$LOG_FILE"
+    # Setup logging
+    exec > >(tee -a "$LOG_FILE") 2>&1
+}
+
+# Only check for root and setup logging when not showing help
+if [ "${1:-}" != "help" ]; then
+    if [ "$EUID" -ne 0 ]; then 
+        echo -e "${RED}Please run with sudo privileges${NC}"
+        echo -e "Usage: sudo $0 [command]"
+        exit 1
+    fi
+    setup_logging
+fi
+
+# Setup logging
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # Function to install ubuntail
@@ -284,31 +303,26 @@ main() {
     echo -e "${BLUE}Ubuntu ${UBUNTU_VERSION} and Tailscale Boot Maker${NC}"
     echo "============================================="
 
-    # Check if running as root
-    if [ "$EUID" -ne 0 ]; then 
-        echo -e "${RED}Please run as root${NC}"
-        exit 1
-    fi
-
-    # Parse command line arguments
     case "${1:-}" in
+        "create")
+            shift  # Remove the 'create' command from arguments
+            main "$@"  # Pass remaining arguments to main function
+            ;;
         "install")
             install
-            exit 0
             ;;
         "uninstall")
             uninstall
-            exit 0
             ;;
         "help")
             help
-            exit 0
-            ;;
-        "create")
-            shift  # Remove 'create' from arguments
             ;;
         "")
             help
+            ;;
+        *)
+            echo -e "${RED}Invalid command: $1${NC}"
+            echo -e "Use '${GREEN}ubuntail help${NC}' for usage information"
             exit 1
             ;;
     esac
