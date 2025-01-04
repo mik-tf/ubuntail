@@ -177,6 +177,33 @@ verify_iso() {
     fi
 }
 
+# Function to validate USB device path
+validate_usb_device() {
+    local device="$1"
+    
+    # Check if device path is /dev/sda
+    if [[ "$device" == "/dev/sda" || "$device" == "/dev/sda"[0-9]* ]]; then
+        echo -e "${RED}Error: Cannot use /dev/sda as it is typically the system drive${NC}"
+        echo -e "${YELLOW}Please select a different device (e.g., /dev/sdb, /dev/sdc)${NC}"
+        return 1
+    fi
+
+    # Check if device path matches expected pattern
+    if ! [[ "$device" =~ ^/dev/sd[b-z]$ ]]; then
+        echo -e "${RED}Error: Invalid device path${NC}"
+        echo -e "${YELLOW}Device path should be in the format /dev/sdb, /dev/sdc, etc.${NC}"
+        return 1
+    fi
+
+    # Check if device exists
+    if [ ! -b "$device" ]; then
+        echo -e "${RED}Error: Device $device does not exist${NC}"
+        return 1
+    fi
+
+    return 0
+}
+
 # Function to prepare USB device
 prepare_usb() {
     local USB_DEVICE="$1"
@@ -347,10 +374,16 @@ main() {
         read -r ISO_PATH
 
         # List and select USB device
-        echo -e "\n${BLUE}Available USB devices:${NC}"
-        lsblk -d -o NAME,SIZE,TYPE,MOUNTPOINT | grep "disk"
-        echo -e "\n${BLUE}Enter USB device (e.g., /dev/sdb):${NC}"
-        read -r USB_DEVICE
+        while true; do
+            echo -e "\n${BLUE}Available USB devices:${NC}"
+            lsblk -d -o NAME,SIZE,TYPE,MOUNTPOINT | grep "disk" | grep -v "sda"
+            echo -e "\n${BLUE}Enter USB device (e.g., /dev/sdb):${NC}"
+            read -r USB_DEVICE
+            if validate_usb_device "$USB_DEVICE"; then
+                break
+            fi
+            echo -e "${YELLOW}Please try again with a valid device.${NC}"
+        done
 
         # Get username (with default value)
         echo -e "\n${BLUE}Enter username (default: ubuntu):${NC}"
@@ -406,6 +439,11 @@ main() {
 
     # Hash the password
     ENCRYPTED_PASS=$(mkpasswd -m sha-512 "$NODE_PASSWORD")
+
+    # Validate USB device
+    if ! validate_usb_device "$USB_DEVICE"; then
+        exit 1
+    fi
 
     # Prepare USB
     prepare_usb "$USB_DEVICE"
