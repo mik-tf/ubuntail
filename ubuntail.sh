@@ -231,20 +231,43 @@ prepare_usb() {
     umount "${USB_DEVICE}"* 2>/dev/null || true
     
     # Create partitions
-    parted "$USB_DEVICE" mklabel gpt
-    parted "$USB_DEVICE" mkpart "EFI" fat32 1MiB 512MiB
-    parted "$USB_DEVICE" mkpart "UBUNTU-BOOT" fat32 512MiB 7GiB
-    parted "$USB_DEVICE" mkpart "SECURE-CONFIG" 7GiB 100%
-    parted "$USB_DEVICE" set 1 esp on
-    parted "$USB_DEVICE" set 2 boot on
+    echo "Creating partition table..."
+    parted "$USB_DEVICE" --script mklabel gpt
+
+    echo "Creating partitions..."
+    parted "$USB_DEVICE" --script \
+        mkpart "EFI" fat32 1MiB 512MiB \
+        mkpart "UBUNTU-BOOT" fat32 512MiB 7GiB \
+        mkpart "SECURE-CONFIG" 7GiB 100%
+    
+    parted "$USB_DEVICE" --script set 1 esp on
+    parted "$USB_DEVICE" --script set 2 boot on
+    
+    # Wait for the system to recognize the new partitions
+    echo "Waiting for partitions to be recognized..."
+    sleep 5
+    partprobe "$USB_DEVICE"
+    sleep 2
     
     # Format partitions
+    echo "Formatting EFI partition..."
     mkfs.fat -F 32 -n "EFI" "${USB_DEVICE}1"
+    
+    echo "Formatting boot partition..."
     mkfs.fat -F 32 -n "UBUNTU-BOOT" "${USB_DEVICE}2"
     
     # Setup encrypted partition with better security
+    echo "Setting up encrypted partition..."
+    echo -e "${YELLOW}You will be asked to set an encryption passphrase for the secure configuration partition.${NC}"
+    echo -e "${YELLOW}Please remember this passphrase as it will be needed to access the secure data.${NC}"
+    echo
+
+    # Create encrypted partition
     cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 "${USB_DEVICE}3"
+
+    echo -e "\n${YELLOW}Now enter the same passphrase again to open the encrypted partition:${NC}"
     cryptsetup luksOpen "${USB_DEVICE}3" secure-config
+
     mkfs.ext4 -L "SECURE-CONFIG" /dev/mapper/secure-config
 }
 
@@ -267,7 +290,7 @@ install_tailscale() {
 # Function to validate Tailscale auth key
 validate_tailscale_key() {
     local KEY="$1"
-    if [[ ! $KEY =~ ^ts[a-zA-Z0-9]{21}$ ]]; then
+    if [[ ! $KEY =~ ^ts[a-zA-Z0-9-]+$ ]]; then
         echo -e "${RED}Error: Invalid Tailscale auth key format${NC}"
         return 1
     fi
@@ -290,7 +313,6 @@ help() {
     
     echo -e "${PURPLE}Description:${NC} Ubuntail is a tool for creating bootable Ubuntu ${UBUNTU_VERSION} USB drives with Tailscale integration"
     echo -e "${PURPLE}Usage:${NC}       ubuntail [command] [arguments]"
-    echo -e "${PURPLE}Version:${NC}     ${UBUNTU_VERSION}\n"
     
     echo -e "${PURPLE}Commands:${NC}"
     echo -e "  ${GREEN}create <iso-path> <usb-device> <tailscale-key> <username> <password>${NC}"
