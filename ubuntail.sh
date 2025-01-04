@@ -132,6 +132,10 @@ check_dependencies() {
         "mkpasswd"
         "whois"
         "curl"
+        "hdparm"
+        "wipefs"
+        "rsync"
+        "dd"
     )
 
     echo "Checking dependencies..."
@@ -181,15 +185,9 @@ verify_iso() {
 validate_usb_device() {
     local device="$1"
     
-    # Check if device path is /dev/sda
-    if [[ "$device" == "/dev/sda" || "$device" == "/dev/sda"[0-9]* ]]; then
-        echo -e "${RED}Error: Cannot use /dev/sda as it is typically the system drive${NC}"
-        echo -e "${YELLOW}Please select a different device (e.g., /dev/sdb, /dev/sdc)${NC}"
-        return 1
-    fi
 
     # Check if device path matches expected pattern
-    if ! [[ "$device" =~ ^/dev/sd[b-z]$ ]]; then
+    if ! [[ "$device" =~ ^/dev/sd[a-z]$ ]]; then
         echo -e "${RED}Error: Invalid device path${NC}"
         echo -e "${YELLOW}Device path should be in the format /dev/sdb, /dev/sdc, etc.${NC}"
         return 1
@@ -221,34 +219,130 @@ prepare_usb() {
     # Confirm device selection with details
     echo -e "${YELLOW}Selected USB device:${NC}"
     lsblk "$USB_DEVICE" -o NAME,SIZE,MODEL,SERIAL
+    echo -e "${RED}WARNING: ALL DATA ON THIS DEVICE WILL BE ERASED!${NC}"
     read -p "Is this the correct device? (y/N): " confirm
     if [ "$confirm" != "y" ]; then
         echo "Aborted"
         exit 1
     fi
-    
-    # Unmount any existing partitions
-    umount "${USB_DEVICE}"* 2>/dev/null || true
-    
-    # Create partitions
-    echo "Creating partition table..."
-    parted "$USB_DEVICE" --script mklabel gpt
 
-    echo "Creating partitions..."
-    parted "$USB_DEVICE" --script \
-        mkpart "EFI" fat32 1MiB 512MiB \
-        mkpart "UBUNTU-BOOT" fat32 512MiB 7GiB \
-        mkpart "SECURE-CONFIG" 7GiB 100%
+    echo "Preparing device for partitioning..."
     
-    parted "$USB_DEVICE" --script set 1 esp on
-    parted "$USB_DEVICE" --script set 2 boot on
-    
-    # Wait for the system to recognize the new partitions
-    echo "Waiting for partitions to be recognized..."
-    sleep 5
-    partprobe "$USB_DEVICE"
+    # First, ensure all partitions are unmounted
+    echo "Unmounting any existing partitions..."
+    for partition in ${USB_DEVICE}*; do
+        if mount | grep -q "$partition"; then
+            echo "Unmounting $partition..."
+            umount -f "$partition" 2>/dev/null || umount -l "$partition" 2>/dev/null || true
+        fi
+    done
+
+    # Check and close any existing LUKS/mapper devices
+    echo "Checking for existing encrypted volumes..."
+    if [ -e "/dev/mapper/secure-config" ]; then
+        echo "Found existing mapper device, attempting to close..."
+        umount -f /dev/mapper/secure-config 2>/dev/null || true
+        cryptsetup luksClose secure-config 2>/dev/null || {
+            echo "Forcing closure of mapper device..."
+            dmsetup remove --force secure-config 2>/dev/null || true
+        }
+    fi
+
+    # Handle any existing LUKS volumes on the third partition
+    if [ -e "${USB_DEVICE}3" ] && cryptsetup isLuks "${USB_DEVICE}3" 2>/dev/null; then
+        echo -e "${YELLOW}Encrypted partition detected. Attempting to close...${NC}"
+        cryptsetup luksClose "${USB_DEVICE}3" 2>/dev/null || true
+    fi
+
+    # Force all partitions to be forgotten
+    echo "Forcing kernel to forget partitions..."
+    for part in ${USB_DEVICE##*/}[0-9]*; do
+        if [ -e "/sys/block/${USB_DEVICE##*/}/$part" ]; then
+            echo 1 > "/sys/block/${USB_DEVICE##*/}/$part/device/delete" 2>/dev/null || true
+        fi
+    done
+
+    # Force kernel to forget the main device
+    if [ -e "/sys/block/${USB_DEVICE##*/}/device/delete" ]; then
+        echo 1 > "/sys/block/${USB_DEVICE##*/}/device/delete" 2>/dev/null || true
+    fi
     sleep 2
+
+    # Rescan SCSI bus
+    echo "Rescanning SCSI bus..."
+    for host in /sys/class/scsi_host/host*; do
+        echo "- - -" > "$host/scan" 2>/dev/null || true
+    done
+    sleep 5
+
+    # Use wipefs to clear all signatures
+    echo "Clearing all partition signatures..."
+    wipefs -a "$USB_DEVICE" || true
+    sleep 2
+
+    # Clear the beginning and end of the device
+    echo "Clearing partition table..."
+    dd if=/dev/zero of="$USB_DEVICE" bs=1M count=10 conv=fsync 2>/dev/null || true
     
+    # Get device size and clear the end
+    DEVICE_SIZE_BYTES=$(blockdev --getsize64 "$USB_DEVICE")
+    DEVICE_SIZE_MB=$((DEVICE_SIZE_BYTES / 1024 / 1024))
+    END_POSITION=$((DEVICE_SIZE_MB - 10))
+    if [ $END_POSITION -gt 10 ]; then
+        dd if=/dev/zero of="$USB_DEVICE" bs=1M seek=$END_POSITION count=10 conv=fsync 2>/dev/null || true
+    fi
+
+    sync
+    sleep 2
+
+    # Try multiple partition table creation methods
+    echo "Creating new partition table..."
+    dd if=/dev/zero of="$USB_DEVICE" bs=512 count=1 conv=fsync 2>/dev/null || true
+    sync
+    sleep 1
+    
+    sgdisk --zap-all "$USB_DEVICE" || true
+    sleep 1
+    
+    parted -s "$USB_DEVICE" mklabel gpt
+    sleep 1
+
+    # Force kernel to re-read partition table multiple ways
+    blockdev --rereadpt "$USB_DEVICE" 2>/dev/null || true
+    partprobe -s "$USB_DEVICE" || true
+    hdparm -z "$USB_DEVICE" 2>/dev/null || true
+    sleep 2
+
+    # Create partitions one at a time
+    echo "Creating partitions..."
+    parted -s "$USB_DEVICE" mkpart "EFI" fat32 1MiB 512MiB
+    sleep 1
+    partprobe "$USB_DEVICE" || true
+    
+    parted -s "$USB_DEVICE" mkpart "UBUNTU-BOOT" fat32 512MiB 7GiB
+    sleep 1
+    partprobe "$USB_DEVICE" || true
+    
+    parted -s "$USB_DEVICE" mkpart "SECURE-CONFIG" 7GiB 100%
+    sleep 1
+    partprobe "$USB_DEVICE" || true
+
+    # Set flags
+    parted -s "$USB_DEVICE" set 1 esp on
+    parted -s "$USB_DEVICE" set 2 boot on
+    
+    # Final partition table refresh
+    sync
+    partprobe -s "$USB_DEVICE" || true
+    hdparm -z "$USB_DEVICE" 2>/dev/null || true
+    sleep 5
+
+    # Verify partitions were created
+    if [ ! -e "${USB_DEVICE}1" ] || [ ! -e "${USB_DEVICE}2" ] || [ ! -e "${USB_DEVICE}3" ]; then
+        echo -e "${RED}Error: Partitions were not created properly${NC}"
+        exit 1
+    fi
+
     # Format partitions
     echo "Formatting EFI partition..."
     mkfs.fat -F 32 -n "EFI" "${USB_DEVICE}1"
@@ -256,19 +350,46 @@ prepare_usb() {
     echo "Formatting boot partition..."
     mkfs.fat -F 32 -n "UBUNTU-BOOT" "${USB_DEVICE}2"
     
-    # Setup encrypted partition with better security
+    # Setup encrypted partition
     echo "Setting up encrypted partition..."
     echo -e "${YELLOW}You will be asked to set an encryption passphrase for the secure configuration partition.${NC}"
     echo -e "${YELLOW}Please remember this passphrase as it will be needed to access the secure data.${NC}"
     echo
 
-    # Create encrypted partition
-    cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 "${USB_DEVICE}3"
+    # Create encrypted partition with enhanced security
+    cryptsetup luksFormat \
+        --type luks2 \
+        --cipher aes-xts-plain64 \
+        --key-size 512 \
+        --hash sha512 \
+        --iter-time 5000 \
+        --verify-passphrase \
+        "${USB_DEVICE}3"
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Error: Failed to create encrypted partition${NC}"
+        exit 1
+    fi
 
     echo -e "\n${YELLOW}Now enter the same passphrase again to open the encrypted partition:${NC}"
     cryptsetup luksOpen "${USB_DEVICE}3" secure-config
 
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Error: Failed to open encrypted partition${NC}"
+        exit 1
+    fi
+
+    # Format the encrypted partition
+    echo "Formatting encrypted partition..."
     mkfs.ext4 -L "SECURE-CONFIG" /dev/mapper/secure-config
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Error: Failed to format encrypted partition${NC}"
+        cryptsetup luksClose secure-config
+        exit 1
+    fi
+
+    echo -e "${GREEN}USB device preparation completed successfully${NC}"
 }
 
 # Function to install Tailscale with retry logic
@@ -395,11 +516,22 @@ main() {
         echo -e "\n${BLUE}Enter path to Ubuntu ${UBUNTU_VERSION} Server ISO:${NC}"
         read -r ISO_PATH
 
+        # Function to list available USB devices
+        list_usb_devices() {
+            echo -e "\n${BLUE}Available USB devices:${NC}"
+            lsblk -d -o NAME,SIZE,MODEL,SERIAL,TYPE,TRAN | grep -i "usb\|disk" | \
+            while read -r line; do
+                if [[ $line == *"usb"* ]] || [[ $line == *"disk"* ]]; then
+                    echo "$line"
+                fi
+            done
+            echo
+        }
+
         # List and select USB device
         while true; do
-            echo -e "\n${BLUE}Available USB devices:${NC}"
-            lsblk -d -o NAME,SIZE,TYPE,MOUNTPOINT | grep "disk" | grep -v "sda"
-            echo -e "\n${BLUE}Enter USB device (e.g., /dev/sdb):${NC}"
+            list_usb_devices
+            echo -e "${BLUE}Enter USB device (e.g., /dev/sdb):${NC}"
             read -r USB_DEVICE
             if validate_usb_device "$USB_DEVICE"; then
                 break
@@ -410,7 +542,6 @@ main() {
         # Get username (with default value)
         echo -e "\n${BLUE}Enter username (default: ubuntu):${NC}"
         read -r NODE_USERNAME
-        NODE_USERNAME=${NODE_USERNAME:-ubuntu}  # Use 'ubuntu' if no input provided
 
         # Get Tailscale auth key with validation
         while true; do
@@ -479,11 +610,146 @@ main() {
     mount "${USB_DEVICE}1" /mnt/efi || { echo -e "${RED}Failed to mount EFI partition${NC}"; exit 1; }
     mount "${USB_DEVICE}2" /mnt/usb-boot || { echo -e "${RED}Failed to mount boot partition${NC}"; exit 1; }
     mount /dev/mapper/secure-config /mnt/usb-secure || { echo -e "${RED}Failed to mount secure partition${NC}"; exit 1; }
-    mount -o loop "$ISO_PATH" /mnt/iso || { echo -e "${RED}Failed to mount ISO${NC}"; exit 1; }
 
-    # Copy ISO contents with progress
+    echo "Mounting ISO..."
+    if mountpoint -q /mnt/iso; then
+        echo "ISO mount point is already in use, attempting to unmount..."
+        umount /mnt/iso || { echo -e "${RED}Failed to unmount existing ISO mount${NC}"; exit 1; }
+    fi
+
+    if ! mount -o loop "$ISO_PATH" /mnt/iso; then
+        # Check if it's already mounted somewhere else
+        MOUNTED_LOCATION=$(findmnt -n -o TARGET "$ISO_PATH" 2>/dev/null)
+        if [ -n "$MOUNTED_LOCATION" ]; then
+            echo "ISO is already mounted at $MOUNTED_LOCATION"
+            echo "Using existing mount point..."
+            # Create symlink to existing mount
+            ln -sf "$MOUNTED_LOCATION" /mnt/iso
+        else
+            echo -e "${RED}Failed to mount ISO and couldn't find existing mount${NC}"
+            exit 1
+        fi
+    fi
+
+    # Copy ISO contents with progress and error handling
     echo "Copying Ubuntu installation files..."
-    rsync -ah --progress /mnt/iso/ /mnt/usb-boot/
+    echo "This may take several minutes..."
+    
+    # First, try using cp for critical files
+    echo "Copying essential files..."
+    mkdir -p "/mnt/usb-boot/casper/"
+    
+    # Copy all squashfs files
+    for squashfs in /mnt/iso/casper/*.squashfs /mnt/iso/casper/*.squashfs.gpg; do
+        if [ -f "$squashfs" ]; then
+            echo "Copying $(basename "$squashfs")..."
+            cp -v "$squashfs" "/mnt/usb-boot/casper/" || {
+                echo -e "${RED}Error: Failed to copy $(basename "$squashfs")${NC}"
+                echo "Retrying copy with different method..."
+                dd if="$squashfs" of="/mnt/usb-boot/casper/$(basename "$squashfs")" bs=1M status=progress || {
+                    echo -e "${RED}Critical Error: Could not copy $(basename "$squashfs")${NC}"
+                    exit 1
+                }
+            }
+        fi
+    done
+
+    # Then copy the rest of the files
+    echo "Copying remaining files..."
+    rsync -ah --info=progress2 --exclude='casper/*.squashfs' --exclude='casper/*.squashfs.gpg' /mnt/iso/ /mnt/usb-boot/ || {
+        echo -e "${YELLOW}Warning: Some non-critical files may not have copied completely${NC}"
+        echo -e "${YELLOW}Continuing with installation...${NC}"
+    }
+
+    # Verify the squashfs files were copied correctly
+    echo "Verifying squashfs files..."
+    VERIFICATION_FAILED=0
+    for squashfs in /mnt/iso/casper/*.squashfs; do
+        if [ -f "$squashfs" ]; then
+            BASENAME=$(basename "$squashfs")
+            if [ -f "/mnt/usb-boot/casper/$BASENAME" ]; then
+                ISO_SQUASHFS_SIZE=$(stat -c %s "$squashfs")
+                USB_SQUASHFS_SIZE=$(stat -c %s "/mnt/usb-boot/casper/$BASENAME")
+                if [ "$ISO_SQUASHFS_SIZE" = "$USB_SQUASHFS_SIZE" ]; then
+                    echo -e "${GREEN}$BASENAME verified successfully${NC}"
+                else
+                    echo -e "${RED}Error: $BASENAME size mismatch${NC}"
+                    echo "ISO size: $ISO_SQUASHFS_SIZE"
+                    echo "USB size: $USB_SQUASHFS_SIZE"
+                    VERIFICATION_FAILED=1
+                fi
+            else
+                echo -e "${RED}Error: $BASENAME is missing after copy${NC}"
+                VERIFICATION_FAILED=1
+            fi
+        fi
+    done
+
+    if [ $VERIFICATION_FAILED -eq 1 ]; then
+        echo -e "${RED}Error: One or more squashfs files failed verification${NC}"
+        exit 1
+    fi
+
+    # Unmount ISO before proceeding
+    echo "Unmounting ISO..."
+    umount /mnt/iso || {
+        echo -e "${YELLOW}Warning: Failed to unmount ISO, attempting force unmount...${NC}"
+        umount -f /mnt/iso || {
+            echo -e "${RED}Error: Could not unmount ISO${NC}"
+            exit 1
+        }
+    }
+
+    # Verify essential files
+    echo "Verifying essential files..."
+    KERNEL_LOCATIONS=(
+        "/mnt/usb-boot/casper/vmlinuz"
+        "/mnt/usb-boot/boot/vmlinuz"
+    )
+
+    # ADD THIS NEW ARRAY RIGHT HERE, AFTER KERNEL_LOCATIONS
+    INITRD_LOCATIONS=(
+        "/mnt/usb-boot/casper/initrd"
+        "/mnt/usb-boot/boot/initrd.img"
+    )
+
+    # Check for kernel
+    KERNEL_FOUND=false
+    for location in "${KERNEL_LOCATIONS[@]}"; do
+        if [ -f "$location" ]; then
+            KERNEL_FOUND=true
+            break
+        fi
+    done
+
+    # Check for initrd
+    INITRD_FOUND=false
+    for location in "${INITRD_LOCATIONS[@]}"; do
+        if [ -f "$location" ]; then
+            INITRD_FOUND=true
+            break
+        fi
+    done
+
+    if ! $KERNEL_FOUND; then
+        echo -e "${RED}Error: Kernel file (vmlinuz) is missing${NC}"
+        echo "The USB drive may not boot correctly"
+        read -p "Continue anyway? (y/N): " confirm
+        if [ "$confirm" != "y" ]; then
+            echo "Aborting installation"
+            exit 1
+        fi
+    fi
+
+    if ! $INITRD_FOUND; then
+        echo -e "${RED}Error: Initial ramdisk (initrd) is missing${NC}"
+        echo "The USB drive may not boot correctly"
+        read -p "Continue anyway? (y/N): " confirm
+        if [ "$confirm" != "y" ]; then
+            echo "Aborting installation"
+            exit 1
+        fi
+    fi
 
     # Store credentials securely
     echo "Storing secure credentials..."
